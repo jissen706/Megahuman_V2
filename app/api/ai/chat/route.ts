@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { auth } from "@/app/api/auth/[...nextauth]/route";
-import { anthropic, MODEL } from "@/lib/claude";
+import { anthropic, FAST_MODEL } from "@/lib/claude";
 import { createServiceRoleClient, emailToUserId } from "@/lib/supabase";
 import { sendEmail } from "@/lib/gmail";
 import type Anthropic from "@anthropic-ai/sdk";
@@ -83,6 +83,21 @@ const TOOLS: Anthropic.Tool[] = [
         },
       },
       required: ["thread_id"],
+    },
+  },
+  {
+    name: "get_scheduled_emails",
+    description:
+      "Fetch all scheduled (pending) emails that haven't been sent yet. Shows recipient, subject, body, and scheduled send time.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        include_sent: {
+          type: "boolean",
+          description: "Include already-sent scheduled emails (default false, only pending)",
+        },
+      },
+      required: [],
     },
   },
   {
@@ -202,11 +217,49 @@ async function executeGetEmailThread(
   });
 }
 
+async function executeGetScheduledEmails(
+  userId: string,
+  input: Record<string, unknown>
+): Promise<string> {
+  const supabase = createServiceRoleClient();
+  let query = supabase
+    .from("scheduled_sends")
+    .select("id, to_email, subject, body, send_at, sent")
+    .eq("user_id", userId)
+    .order("send_at", { ascending: true });
+
+  if (!input.include_sent) {
+    query = query.eq("sent", false);
+  }
+
+  const { data, error } = await query;
+  if (error) return JSON.stringify({ error: error.message });
+  if (!data || data.length === 0) {
+    return JSON.stringify({ results: [], message: "No scheduled emails found." });
+  }
+
+  return JSON.stringify({
+    results: data.map((s) => ({
+      id: s.id,
+      to: s.to_email,
+      subject: s.subject,
+      body: s.body,
+      send_at: s.send_at,
+      sent: s.sent,
+    })),
+    total: data.length,
+  });
+}
+
 async function executeSendBatchEmails(
   userId: string,
   accessToken: string,
   input: Record<string, unknown>
 ): Promise<string> {
+  if (!Array.isArray(input.emails) || input.emails.length === 0) {
+    return JSON.stringify({ error: "No emails provided", summary: "0 sent, 0 scheduled, 0 failed", results: [] });
+  }
+
   const emails = input.emails as Array<{
     to: string;
     subject: string;
@@ -291,6 +344,8 @@ async function executeTool(
       return executeSearchEmails(userId, input);
     case "get_email_thread":
       return executeGetEmailThread(userId, input);
+    case "get_scheduled_emails":
+      return executeGetScheduledEmails(userId, input);
     case "send_batch_emails":
       return executeSendBatchEmails(userId, accessToken, input);
     default:
@@ -299,9 +354,10 @@ async function executeTool(
 }
 
 export async function POST(req: NextRequest) {
+  try {
   const rawSession = await auth();
   if (!rawSession) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return new NextResponse("Unauthorized", { status: 401 });
   }
   const session = rawSession as unknown as ExtendedSession;
   const { accessToken } = session;
@@ -309,9 +365,16 @@ export async function POST(req: NextRequest) {
     (session.userId as string | undefined) ?? emailToUserId(session.user.email);
   const userName = session.user.name || session.user.email;
 
-  const parsed = chatSchema.safeParse(await req.json());
+  let body;
+  try {
+    body = await req.json();
+  } catch {
+    return new NextResponse("Invalid JSON", { status: 400 });
+  }
+
+  const parsed = chatSchema.safeParse(body);
   if (!parsed.success) {
-    return NextResponse.json({ error: "Invalid request" }, { status: 400 });
+    return new NextResponse("Invalid request", { status: 400 });
   }
 
   const { messages } = parsed.data;
@@ -343,7 +406,7 @@ Guidelines:
 
   for (let iteration = 0; iteration < 10; iteration++) {
     const response = await anthropic.messages.create({
-      model: MODEL,
+      model: FAST_MODEL,
       max_tokens: 2048,
       system: systemPrompt,
       messages: currentMessages,
@@ -395,14 +458,37 @@ Guidelines:
       });
     }
 
-    // Append assistant response and tool results to messages
+    // Append assistant response and tool results to messages.
+    // Reconstruct content blocks to match MessageParam input types.
+    const assistantContent: Anthropic.ContentBlockParam[] = response.content.map((block) => {
+      if (block.type === "text") {
+        return { type: "text" as const, text: block.text };
+      }
+      if (block.type === "tool_use") {
+        return {
+          type: "tool_use" as const,
+          id: block.id,
+          name: block.name,
+          input: block.input as Record<string, unknown>,
+        };
+      }
+      return { type: "text" as const, text: "" };
+    });
+
     currentMessages = [
       ...currentMessages,
-      { role: "assistant" as const, content: response.content },
+      { role: "assistant" as const, content: assistantContent },
       { role: "user" as const, content: toolResultMessages },
     ];
   }
 
   // If we hit max iterations, return what we have
-  return NextResponse.json({ error: "Max tool iterations reached" }, { status: 500 });
+  return new NextResponse("Max tool iterations reached", { status: 500 });
+  } catch (err) {
+    console.error("Chat route error:", err);
+    return new NextResponse(
+      err instanceof Error ? err.message : "Chat failed",
+      { status: 500 }
+    );
+  }
 }

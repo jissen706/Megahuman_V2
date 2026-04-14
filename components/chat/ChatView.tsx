@@ -146,8 +146,8 @@ export default function ChatView() {
       });
 
       if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.error || "Chat request failed");
+        const errText = await res.text();
+        throw new Error(errText || "Chat request failed");
       }
 
       const reader = res.body?.getReader();
@@ -342,7 +342,7 @@ export default function ChatView() {
             style={{ minHeight: "42px", maxHeight: "120px" }}
             onInput={(e) => {
               const target = e.target as HTMLTextAreaElement;
-              target.style.height = "42px";
+              target.style.height = "auto";
               target.style.height = `${Math.min(target.scrollHeight, 120)}px`;
             }}
           />

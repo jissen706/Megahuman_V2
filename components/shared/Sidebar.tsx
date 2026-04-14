@@ -7,11 +7,6 @@ import { motion } from "motion/react";
 import ComposeModal from "@/components/compose/ComposeModal";
 import { toast } from "sonner";
 
-const NAV = [
-  { href: "/inbox", label: "Inbox" },
-  { href: "/sent",  label: "Sent" },
-];
-
 export default function Sidebar() {
   const pathname = usePathname();
   const router = useRouter();
@@ -28,7 +23,12 @@ export default function Sidebar() {
     setSyncing(true);
     try {
       const res = await fetch("/api/gmail/sync", { method: "POST" });
-      const data = await res.json();
+      let data;
+      try {
+        data = await res.json();
+      } catch {
+        throw new Error(`Sync failed (status ${res.status})`);
+      }
       if (!res.ok) throw new Error(data.error ?? "Sync failed");
       if (!silent) toast.success(`Synced ${data.synced} emails`);
       router.refresh();

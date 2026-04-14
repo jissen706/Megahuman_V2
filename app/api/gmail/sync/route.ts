@@ -16,6 +16,7 @@ type ExtendedSession = {
  * Syncs inbox + sent mail into Supabase, then triages inline (no Inngest needed).
  */
 export async function POST() {
+  try {
   const rawSession = await auth();
   if (!rawSession) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -38,10 +39,19 @@ export async function POST() {
   const toEpochSec = (row: { received_at: string } | null) =>
     row?.received_at ? Math.floor(new Date(row.received_at).getTime() / 1000) - 60 : undefined;
 
-  const [inboxMessages, sentMessages] = await Promise.all([
-    fetchInboxByCategory(accessToken, 100, toEpochSec(latestInboxRow)),
-    fetchSentMessages(accessToken, 100, toEpochSec(latestSentRow)),
-  ]);
+  let inboxMessages, sentMessages;
+  try {
+    [inboxMessages, sentMessages] = await Promise.all([
+      fetchInboxByCategory(accessToken, 100, toEpochSec(latestInboxRow)),
+      fetchSentMessages(accessToken, 100, toEpochSec(latestSentRow)),
+    ]);
+  } catch (gmailErr) {
+    console.error("Gmail API error:", gmailErr);
+    return NextResponse.json(
+      { error: gmailErr instanceof Error ? gmailErr.message : "Gmail API failed" },
+      { status: 502 }
+    );
+  }
 
   // Deduplicate by ID — some messages appear in both inbox and sent
   const seen = new Set<string>();
@@ -66,7 +76,7 @@ export async function POST() {
     is_sent: m.isSent,
     is_read: false,
     is_archived: false,
-    triage_label: "triageLabel" in m ? m.triageLabel : null,
+    triage_label: "triageLabel" in m ? (m as Record<string, unknown>).triageLabel as string : null,
   }));
 
   const uniqueRows = Array.from(new Map(rows.map((r) => [r.id, r])).values());
@@ -162,4 +172,11 @@ export async function POST() {
   }
 
   return NextResponse.json({ synced: allMessages.length, voiceProfileUpdated });
+  } catch (err) {
+    console.error("Sync route error:", err);
+    return NextResponse.json(
+      { error: err instanceof Error ? err.message : "Sync failed" },
+      { status: 500 }
+    );
+  }
 }
