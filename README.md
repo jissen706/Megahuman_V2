@@ -4,7 +4,7 @@
 
 MegaHuman is an AI-native email client that learns how you write and handles your inbox for you. It reads your sent emails, extracts your voice, and drafts replies that sound exactly like you typed them. No more staring at blank compose windows. No more inbox anxiety.
 
-**Want early access? Email jishnuu at seas.upenn.edu**
+**Want early access? Email jishnuu_at_seas.upenn.edu**
 
 ---
 
