@@ -6,6 +6,8 @@ import { type Email } from "@/lib/supabase";
 
 interface SentEmail extends Email {
   opened_at?: string | null;
+  open_count?: number;
+  preloaded_only?: boolean;
 }
 
 interface Props {
@@ -24,17 +26,49 @@ function formatRelative(dateStr: string): string {
   return new Date(dateStr).toLocaleDateString([], { month: "short", day: "numeric" });
 }
 
-function ReadReceiptBadge({ openedAt }: { openedAt: string | null | undefined }) {
-  if (openedAt) {
+function ReadReceiptBadge({
+  openedAt,
+  openCount,
+  preloadedOnly,
+}: {
+  openedAt: string | null | undefined;
+  openCount: number | undefined;
+  preloadedOnly: boolean | undefined;
+}) {
+  const count = openCount ?? 0;
+
+  if (count > 0 && openedAt) {
+    const label =
+      count >= 2
+        ? `Opened ${count} times · first ${formatRelative(openedAt)}`
+        : `Opened ${formatRelative(openedAt)}`;
     return (
       <div className="flex items-center gap-1.5 shrink-0">
         <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
-        <span className="text-[11px] text-emerald-600 font-medium whitespace-nowrap">
-          Opened {formatRelative(openedAt)}
+        <span
+          title={label}
+          className="text-[11px] text-emerald-600 font-medium whitespace-nowrap truncate max-w-[140px]"
+        >
+          {count >= 2 ? `Opened ${count}× · ${formatRelative(openedAt)}` : `Opened ${formatRelative(openedAt)}`}
         </span>
       </div>
     );
   }
+
+  if (preloadedOnly) {
+    return (
+      <div
+        className="flex items-center gap-1.5 shrink-0"
+        title="Recipient's mail client prefetched the image (Apple Mail Privacy Protection or Gmail prefetch). Unable to confirm a real read."
+      >
+        <span className="h-1.5 w-1.5 rounded-full bg-amber-300" />
+        <span className="text-[11px] text-amber-600 font-medium whitespace-nowrap">
+          Likely opened
+        </span>
+      </div>
+    );
+  }
+
   return (
     <div className="flex items-center gap-1.5 shrink-0">
       <span className="h-1.5 w-1.5 rounded-full bg-zinc-300" />
@@ -101,7 +135,11 @@ export default function SentList({ emails }: Props) {
               })}
             </span>
             <div className="w-36 shrink-0 flex justify-end">
-              <ReadReceiptBadge openedAt={email.opened_at} />
+              <ReadReceiptBadge
+                openedAt={email.opened_at}
+                openCount={email.open_count}
+                preloadedOnly={email.preloaded_only}
+              />
             </div>
           </motion.div>
         ))}

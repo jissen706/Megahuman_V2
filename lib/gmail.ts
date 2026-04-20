@@ -71,6 +71,30 @@ async function gmailPost<T>(accessToken: string, path: string, body: unknown): P
   return res.json() as Promise<T>;
 }
 
+async function gmailPut<T>(accessToken: string, path: string, body: unknown): Promise<T> {
+  const res = await fetch(`${GMAIL_BASE}${path}`, {
+    method: "PUT",
+    headers: authHeaders(accessToken),
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Gmail PUT ${path} failed ${res.status}: ${text}`);
+  }
+  return res.json() as Promise<T>;
+}
+
+async function gmailDelete(accessToken: string, path: string): Promise<void> {
+  const res = await fetch(`${GMAIL_BASE}${path}`, {
+    method: "DELETE",
+    headers: authHeaders(accessToken),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Gmail DELETE ${path} failed ${res.status}: ${text}`);
+  }
+}
+
 function getHeader(headers: Array<{ name: string; value: string }>, name: string): string {
   return headers.find((h) => h.name.toLowerCase() === name.toLowerCase())?.value ?? "";
 }
@@ -347,4 +371,278 @@ export async function archiveMessage(
   await gmailPost<unknown>(accessToken, `/messages/${messageId}/modify`, {
     removeLabelIds: ["INBOX"],
   });
+}
+
+// -----------------------------------------------------------------------------
+// Drafts API
+// -----------------------------------------------------------------------------
+
+export interface DraftAttachmentInput {
+  filename: string;
+  mimeType: string;
+  data: Buffer; // raw bytes
+}
+
+export interface DraftSummary {
+  draftId: string;
+  messageId: string;
+  threadId: string;
+  to: string;
+  subject: string;
+  snippet: string;
+  updatedAt: Date;
+  hasAttachment: boolean;
+  attachmentNames: string[];
+}
+
+export interface DraftDetail extends DraftSummary {
+  bodyPlain: string;
+  bodyHtml: string;
+  attachments: GmailAttachment[];
+}
+
+// Wrap base64 data at 76 chars per line (RFC 2045)
+function base64Wrap(data: string): string {
+  return data.replace(/(.{76})/g, "$1\r\n");
+}
+
+function escapeHtmlBody(body: string): string {
+  const escaped = body
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+  return escaped.replace(/\n/g, "<br>");
+}
+
+/**
+ * Build a raw RFC 2822 MIME message suitable for base64url-encoding into
+ * Gmail's `raw` field. Supports a single HTML body plus zero or more
+ * file attachments encoded as multipart/mixed.
+ */
+export function buildMimeMessage(opts: {
+  to: string;
+  subject: string;
+  bodyHtml: string;
+  attachments?: DraftAttachmentInput[];
+  inReplyTo?: string;
+  references?: string;
+}): string {
+  const { to, subject, bodyHtml, attachments = [], inReplyTo, references } = opts;
+  const baseHeaders = [
+    `To: ${to}`,
+    `Subject: ${subject}`,
+    "MIME-Version: 1.0",
+  ];
+  if (inReplyTo) baseHeaders.push(`In-Reply-To: ${inReplyTo}`);
+  if (references) baseHeaders.push(`References: ${references}`);
+
+  if (attachments.length === 0) {
+    // Simple HTML email
+    return [
+      ...baseHeaders,
+      "Content-Type: text/html; charset=utf-8",
+      "",
+      bodyHtml,
+    ].join("\r\n");
+  }
+
+  // multipart/mixed: html body + each attachment
+  const boundary = `mh_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+  const parts: string[] = [];
+
+  parts.push(
+    `--${boundary}`,
+    "Content-Type: text/html; charset=utf-8",
+    "",
+    bodyHtml
+  );
+
+  for (const att of attachments) {
+    const encoded = base64Wrap(att.data.toString("base64"));
+    parts.push(
+      `--${boundary}`,
+      `Content-Type: ${att.mimeType}; name="${att.filename}"`,
+      `Content-Disposition: attachment; filename="${att.filename}"`,
+      "Content-Transfer-Encoding: base64",
+      "",
+      encoded
+    );
+  }
+  parts.push(`--${boundary}--`);
+
+  return [
+    ...baseHeaders,
+    `Content-Type: multipart/mixed; boundary="${boundary}"`,
+    "",
+    ...parts,
+  ].join("\r\n");
+}
+
+/**
+ * Create a Gmail draft. Returns the new draft's ID and its underlying
+ * message ID.
+ */
+export async function createDraft(
+  accessToken: string,
+  opts: {
+    to: string;
+    subject: string;
+    bodyHtml: string;
+    attachments?: DraftAttachmentInput[];
+  }
+): Promise<{ draftId: string; messageId: string; threadId: string }> {
+  const raw = buildMimeMessage(opts);
+  const encoded = Buffer.from(raw).toString("base64url");
+  const data = await gmailPost<{ id: string; message: { id: string; threadId: string } }>(
+    accessToken,
+    "/drafts",
+    { message: { raw: encoded } }
+  );
+  return {
+    draftId: data.id,
+    messageId: data.message.id,
+    threadId: data.message.threadId,
+  };
+}
+
+function summarizeDraft(draftId: string, raw: GmailApiMessage): DraftSummary {
+  const headers = raw.payload?.headers ?? [];
+  const attachments = collectAttachments(raw.payload);
+  // Gmail message has internalDate in ms since epoch (not in our GmailApiMessage type,
+  // but we cast to access it)
+  const internal = (raw as unknown as { internalDate?: string }).internalDate;
+  const updatedAt = internal ? new Date(Number(internal)) : new Date();
+  return {
+    draftId,
+    messageId: raw.id,
+    threadId: raw.threadId,
+    to: getHeader(headers, "To"),
+    subject: getHeader(headers, "Subject"),
+    snippet: raw.snippet ?? "",
+    updatedAt,
+    hasAttachment: attachments.length > 0,
+    attachmentNames: attachments.map((a) => a.filename),
+  };
+}
+
+/**
+ * List Gmail drafts (most recent first), fetching full metadata for each.
+ * Returns up to `maxResults` (default 50).
+ */
+export async function listDrafts(
+  accessToken: string,
+  maxResults = 50
+): Promise<DraftSummary[]> {
+  const params = new URLSearchParams({ maxResults: String(maxResults) });
+  const data = await gmailGet<{ drafts?: Array<{ id: string; message: { id: string; threadId: string } }> }>(
+    accessToken,
+    `/drafts?${params}`
+  );
+  const drafts = data.drafts ?? [];
+  if (drafts.length === 0) return [];
+
+  // Fetch each draft's full payload in small batches
+  const results: DraftSummary[] = [];
+  const batchSize = 5;
+  for (let i = 0; i < drafts.length; i += batchSize) {
+    const batch = drafts.slice(i, i + batchSize);
+    const fetched = await Promise.all(
+      batch.map((d) =>
+        gmailGet<{ id: string; message: GmailApiMessage }>(
+          accessToken,
+          `/drafts/${d.id}?format=metadata&metadataHeaders=To&metadataHeaders=Subject`
+        )
+          .then((full) => ({ ok: true as const, draftId: d.id, message: full.message }))
+          .catch((err) => ({ ok: false as const, draftId: d.id, err }))
+      )
+    );
+    for (const r of fetched) {
+      if (r.ok) results.push(summarizeDraft(r.draftId, r.message));
+    }
+    if (i + batchSize < drafts.length) await new Promise((r) => setTimeout(r, 150));
+  }
+
+  // Sort by updatedAt descending
+  results.sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime());
+  return results;
+}
+
+/**
+ * Fetch a single draft in full (body + attachment list).
+ */
+export async function getDraft(
+  accessToken: string,
+  draftId: string
+): Promise<DraftDetail> {
+  const data = await gmailGet<{ id: string; message: GmailApiMessage }>(
+    accessToken,
+    `/drafts/${draftId}?format=full`
+  );
+  const summary = summarizeDraft(draftId, data.message);
+  const attachments = collectAttachments(data.message.payload);
+  const bodyHtml = extractHtml(data.message.payload, data.message.id, attachments);
+  const bodyPlain = findPart(data.message.payload, "text/plain");
+  return { ...summary, attachments, bodyHtml, bodyPlain };
+}
+
+/**
+ * Update an existing draft's to/subject/body. Attachments are preserved
+ * only if re-supplied — this mirrors Gmail's own behavior where PUT
+ * replaces the full message.
+ *
+ * Returns the draft's new internal messageId (Gmail assigns a new one
+ * on each PUT because the underlying message is replaced).
+ */
+export async function updateDraft(
+  accessToken: string,
+  draftId: string,
+  opts: {
+    to: string;
+    subject: string;
+    bodyHtml: string;
+    attachments?: DraftAttachmentInput[];
+  }
+): Promise<{ messageId: string; threadId: string }> {
+  const raw = buildMimeMessage(opts);
+  const encoded = Buffer.from(raw).toString("base64url");
+  const data = await gmailPut<{ id: string; message: { id: string; threadId: string } }>(
+    accessToken,
+    `/drafts/${draftId}`,
+    { message: { raw: encoded } }
+  );
+  return { messageId: data.message.id, threadId: data.message.threadId };
+}
+
+/**
+ * Send an existing draft. Returns the delivered message ID.
+ */
+export async function sendDraft(
+  accessToken: string,
+  draftId: string
+): Promise<string> {
+  const data = await gmailPost<{ id: string }>(
+    accessToken,
+    "/drafts/send",
+    { id: draftId }
+  );
+  return data.id;
+}
+
+/**
+ * Permanently delete a draft.
+ */
+export async function deleteDraft(
+  accessToken: string,
+  draftId: string
+): Promise<void> {
+  await gmailDelete(accessToken, `/drafts/${draftId}`);
+}
+
+/**
+ * Helper: turn a plain-text body into HTML with the same line-break handling
+ * used for sending. Callers pass plain text from UI; we store HTML in Gmail.
+ */
+export function plainTextToHtml(body: string): string {
+  return escapeHtmlBody(body);
 }

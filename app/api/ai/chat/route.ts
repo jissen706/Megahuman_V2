@@ -3,7 +3,8 @@ import { z } from "zod";
 import { auth } from "@/app/api/auth/[...nextauth]/route";
 import { anthropic, FAST_MODEL } from "@/lib/claude";
 import { createServiceRoleClient, emailToUserId } from "@/lib/supabase";
-import { sendEmail } from "@/lib/gmail";
+import { createDraft, plainTextToHtml, sendEmail, type DraftAttachmentInput } from "@/lib/gmail";
+import { buildTrackingPixel, extractSenderContext } from "@/lib/read-receipt";
 import type Anthropic from "@anthropic-ai/sdk";
 
 type ExtendedSession = {
@@ -127,6 +128,39 @@ const TOOLS: Anthropic.Tool[] = [
         },
       },
       required: ["emails"],
+    },
+  },
+  {
+    name: "create_batch_drafts",
+    description:
+      "Create multiple Gmail DRAFTS (not sent) personalized per recipient. Use whenever the user wants to draft multiple similar emails to different people — they will review and send from the Drafts tab themselves. Every draft automatically attaches the PDF the user uploaded in this chat turn (if any). When writing each draft, subtly tailor 2-3 words in the subject line per recipient, and adapt the body to their role/company/context while preserving the user's provided wording for the core message. Do NOT invent facts about a recipient; only personalize based on information the user provided.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        drafts: {
+          type: "array",
+          description:
+            "One draft per recipient. Each entry should be personalized, but the core message must reflect what the user specified.",
+          items: {
+            type: "object",
+            properties: {
+              to: { type: "string", description: "Recipient email address" },
+              name: {
+                type: "string",
+                description: "Recipient's first name if known (used for salutation)",
+              },
+              subject: { type: "string", description: "Subject line for this recipient" },
+              body: {
+                type: "string",
+                description:
+                  "Full email body in plain text, including greeting and sign-off. Newlines are preserved.",
+              },
+            },
+            required: ["to", "subject", "body"],
+          },
+        },
+      },
+      required: ["drafts"],
     },
   },
 ];
@@ -254,7 +288,8 @@ async function executeGetScheduledEmails(
 async function executeSendBatchEmails(
   userId: string,
   accessToken: string,
-  input: Record<string, unknown>
+  input: Record<string, unknown>,
+  senderCtx: { senderIp: string; senderUa: string }
 ): Promise<string> {
   if (!Array.isArray(input.emails) || input.emails.length === 0) {
     return JSON.stringify({ error: "No emails provided", summary: "0 sent, 0 scheduled, 0 failed", results: [] });
@@ -291,6 +326,7 @@ async function executeSendBatchEmails(
       } else {
         // Immediate send with tracking
         const trackingToken = crypto.randomUUID();
+        const sentAt = new Date().toISOString();
 
         await supabase.from("read_receipts").insert({
           token: trackingToken,
@@ -298,6 +334,9 @@ async function executeSendBatchEmails(
           email_message_id: "",
           recipient_email: email.to,
           opened_at: null,
+          sent_at: sentAt,
+          sender_ip: senderCtx.senderIp || null,
+          sender_user_agent: senderCtx.senderUa || null,
         });
 
         const sentMessageId = await sendEmail(accessToken, {
@@ -333,11 +372,111 @@ async function executeSendBatchEmails(
   });
 }
 
+async function executeCreateBatchDrafts(
+  userId: string,
+  accessToken: string,
+  input: Record<string, unknown>,
+  attachment: DraftAttachmentInput | null,
+  senderCtx: { senderIp: string; senderUa: string }
+): Promise<string> {
+  if (!Array.isArray(input.drafts) || input.drafts.length === 0) {
+    return JSON.stringify({
+      error: "No drafts provided",
+      summary: "0 created, 0 failed",
+      results: [],
+    });
+  }
+
+  const drafts = input.drafts as Array<{
+    to: string;
+    name?: string;
+    subject: string;
+    body: string;
+  }>;
+
+  const supabase = createServiceRoleClient();
+  const attachments = attachment ? [attachment] : [];
+  const results: Array<{
+    to: string;
+    name?: string;
+    subject: string;
+    status: string;
+    draftId?: string;
+    error?: string;
+  }> = [];
+
+  for (const d of drafts) {
+    try {
+      // Pre-insert tracking row so pixel requests resolve once draft is sent.
+      // sent_at is null for now — the MegaHuman draft-send endpoint will
+      // set it when the draft actually ships. If the user sends via Gmail
+      // natively we can't know the exact send time; the classifier still
+      // works without it (grace period check is skipped).
+      const trackingToken = crypto.randomUUID();
+      await supabase.from("read_receipts").insert({
+        token: trackingToken,
+        user_id: userId,
+        email_message_id: "",
+        recipient_email: d.to,
+        opened_at: null,
+        sent_at: null,
+        sender_ip: senderCtx.senderIp || null,
+        sender_user_agent: senderCtx.senderUa || null,
+      });
+
+      const htmlBody = plainTextToHtml(d.body) + buildTrackingPixel(trackingToken);
+      const { draftId, messageId } = await createDraft(accessToken, {
+        to: d.to,
+        subject: d.subject,
+        bodyHtml: htmlBody,
+        attachments,
+      });
+
+      // Link the tracking row to the draft's message id. When the user
+      // sends the draft later, the pixel already embeds the token; the
+      // row updates opened_at on pixel fetch.
+      await supabase
+        .from("read_receipts")
+        .update({ email_message_id: messageId })
+        .eq("token", trackingToken);
+
+      results.push({
+        to: d.to,
+        name: d.name,
+        subject: d.subject,
+        status: "created",
+        draftId,
+      });
+    } catch (err) {
+      results.push({
+        to: d.to,
+        name: d.name,
+        subject: d.subject,
+        status: "error",
+        error: err instanceof Error ? err.message : "Unknown error",
+      });
+    }
+  }
+
+  const created = results.filter((r) => r.status === "created").length;
+  const errors = results.filter((r) => r.status === "error").length;
+
+  return JSON.stringify({
+    summary: `${created} draft${created === 1 ? "" : "s"} created${
+      attachment ? ` with ${attachment.filename}` : ""
+    }${errors ? `, ${errors} failed` : ""}`,
+    results,
+    attachmentFilename: attachment?.filename,
+  });
+}
+
 async function executeTool(
   toolName: string,
   input: Record<string, unknown>,
   userId: string,
-  accessToken: string
+  accessToken: string,
+  attachment: DraftAttachmentInput | null,
+  senderCtx: { senderIp: string; senderUa: string }
 ): Promise<string> {
   switch (toolName) {
     case "search_emails":
@@ -347,7 +486,9 @@ async function executeTool(
     case "get_scheduled_emails":
       return executeGetScheduledEmails(userId, input);
     case "send_batch_emails":
-      return executeSendBatchEmails(userId, accessToken, input);
+      return executeSendBatchEmails(userId, accessToken, input, senderCtx);
+    case "create_batch_drafts":
+      return executeCreateBatchDrafts(userId, accessToken, input, attachment, senderCtx);
     default:
       return JSON.stringify({ error: `Unknown tool: ${toolName}` });
   }
@@ -365,11 +506,38 @@ export async function POST(req: NextRequest) {
     (session.userId as string | undefined) ?? emailToUserId(session.user.email);
   const userName = session.user.name || session.user.email;
 
-  let body;
+  const senderCtx = extractSenderContext(req.headers);
+
+  // Accept either JSON or multipart/form-data (when an attachment is included).
+  let body: unknown;
+  let attachment: DraftAttachmentInput | null = null;
+  const contentType = req.headers.get("content-type") ?? "";
   try {
-    body = await req.json();
+    if (contentType.includes("multipart/form-data")) {
+      const form = await req.formData();
+      const messagesRaw = form.get("messages");
+      if (typeof messagesRaw !== "string") {
+        return new NextResponse("Missing messages field", { status: 400 });
+      }
+      try {
+        body = JSON.parse(messagesRaw);
+      } catch {
+        return new NextResponse("messages field is not valid JSON", { status: 400 });
+      }
+      const file = form.get("attachment");
+      if (file && file instanceof File && file.size > 0) {
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        attachment = {
+          filename: file.name || "attachment",
+          mimeType: file.type || "application/octet-stream",
+          data: Buffer.from(bytes),
+        };
+      }
+    } else {
+      body = await req.json();
+    }
   } catch {
-    return new NextResponse("Invalid JSON", { status: 400 });
+    return new NextResponse("Invalid request body", { status: 400 });
   }
 
   const parsed = chatSchema.safeParse(body);
@@ -379,20 +547,27 @@ export async function POST(req: NextRequest) {
 
   const { messages } = parsed.data;
 
+  const attachmentLine = attachment
+    ? `\nATTACHMENT: The user uploaded "${attachment.filename}" (${attachment.mimeType}) with this turn. If they ask you to draft or send emails, attach this file automatically. create_batch_drafts attaches it to every draft it creates.`
+    : "";
+
   const systemPrompt = `You are MegaHuman AI, an email assistant for ${userName}. Today's date is ${new Date().toISOString().slice(0, 10)}.
 
 You help with:
 1. **Sending emails** — single or batch (5-10+ at once). Always confirm details before sending. For batch sends with similar format, personalize each email appropriately.
-2. **Querying emails** — search by sender, subject, date, content. Answer questions about meetings, deadlines, conversations.
-3. **Email insights** — summarize threads, find patterns, track responses.
+2. **Drafting emails** — use create_batch_drafts to create Gmail DRAFTS (not sent) for the user to review later in the Drafts tab. This is the right tool when the user says "draft", "write drafts", "create drafts", or wants to check before sending.
+3. **Querying emails** — search by sender, subject, date, content. Answer questions about meetings, deadlines, conversations.
+4. **Email insights** — summarize threads, find patterns, track responses.
 
 Guidelines:
-- When asked to send multiple emails, use send_batch_emails with all emails in one call.
+- When asked to send multiple emails, use send_batch_emails. When asked to DRAFT multiple emails, use create_batch_drafts.
+- For create_batch_drafts: use the exact wording the user provided for the core message. Personalize only the variable parts: recipient name in the greeting, company/role references, subject line (2-3 word adjustments per recipient). If the user did not specify a greeting or sign-off, use a simple "Hi {Name}," and no sign-off, or match their provided style. Do NOT invent facts about the recipient.
+- Parse recipients from free-form text. Handle both paragraph form ("send to alice@acme.com (PM), bob@beta.io (Eng Lead)") and listed form (newline-separated). Extract email, name, and role/company when present.
 - For scheduled sends, convert relative times (e.g. "tomorrow at 9am") to ISO datetime.
 - When searching, try multiple strategies if the first search returns no results (e.g. search by name, then by email domain).
 - Keep responses concise and actionable.
 - When showing email search results, format them clearly with sender, subject, date, and a brief preview.
-- IMPORTANT: Before sending any emails, clearly list what you're about to send (recipients, subjects, bodies) and ask for confirmation, UNLESS the user has already provided all details explicitly and said to send.`;
+- IMPORTANT: Before SENDING emails, list recipients/subjects/bodies and ask for confirmation, UNLESS the user has already provided all details explicitly and said to send. Before creating DRAFTS you do NOT need to confirm — just create them and tell the user to review in the Drafts tab.${attachmentLine}`;
 
   // Build the Anthropic messages array
   const anthropicMessages: Anthropic.MessageParam[] = messages.map((m) => ({
@@ -448,7 +623,9 @@ Guidelines:
         block.name,
         block.input as Record<string, unknown>,
         userId,
-        accessToken
+        accessToken,
+        attachment,
+        senderCtx
       );
       toolResults.push({ tool: block.name, result });
       toolResultMessages.push({

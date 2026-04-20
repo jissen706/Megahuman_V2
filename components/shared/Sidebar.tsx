@@ -82,6 +82,15 @@ export default function Sidebar() {
       ),
     },
     {
+      href: "/drafts", label: "Drafts",
+      icon: (
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+          <path d="M2.5 13.5h11M3 3h8l2 2v7a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round"/>
+          <path d="M5.5 7h5M5.5 9.5h3.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
+        </svg>
+      ),
+    },
+    {
       href: "/chat", label: "Chat",
       icon: (
         <svg width="14" height="14" viewBox="0 0 16 16" fill="none">

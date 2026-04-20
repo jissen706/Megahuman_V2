@@ -1,12 +1,19 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
+import Link from "next/link";
 
 interface Message {
   id: string;
   role: "user" | "assistant";
   content: string;
   actions?: Array<{ tool: string; result: string }>;
+}
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function ActionCard({ tool, result }: { tool: string; result: string }) {
@@ -57,6 +64,69 @@ function ActionCard({ tool, result }: { tool: string; result: string }) {
     );
   }
 
+  if (tool === "create_batch_drafts") {
+    const results = parsed.results as Array<{
+      to: string;
+      name?: string;
+      subject: string;
+      status: string;
+      draftId?: string;
+      error?: string;
+    }> | undefined;
+    const created = results?.filter((r) => r.status === "created").length ?? 0;
+    return (
+      <div className="my-2 rounded-lg border border-indigo-100 bg-indigo-50/50 px-3 py-2">
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-1.5 text-[12px] font-medium text-indigo-700">
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none">
+              <path
+                d="M3 3h8l2 2v7a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z"
+                stroke="currentColor"
+                strokeWidth="1.3"
+                strokeLinejoin="round"
+              />
+              <path
+                d="M5.5 7h5M5.5 9.5h3.5"
+                stroke="currentColor"
+                strokeWidth="1.3"
+                strokeLinecap="round"
+              />
+            </svg>
+            {parsed.summary || `${created} drafts created`}
+          </div>
+          {created > 0 && (
+            <Link
+              href="/drafts"
+              className="text-[11px] font-medium text-indigo-600 underline-offset-2 hover:underline"
+            >
+              View in Drafts →
+            </Link>
+          )}
+        </div>
+        {results && results.length > 0 && (
+          <div className="mt-1.5 space-y-0.5">
+            {results.map((r, i) => (
+              <div
+                key={i}
+                className="flex items-center gap-2 text-[11px] text-indigo-600"
+              >
+                <span
+                  className={`h-1.5 w-1.5 rounded-full ${
+                    r.status === "created" ? "bg-indigo-400" : "bg-red-400"
+                  }`}
+                />
+                <span className="truncate">{r.name ? `${r.name} <${r.to}>` : r.to}</span>
+                <span className="ml-auto shrink-0 truncate text-indigo-400">
+                  {r.status === "created" ? r.subject : r.error}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  }
+
   if (tool === "search_emails") {
     const results = parsed.results as Array<{
       from: string;
@@ -101,8 +171,10 @@ export default function ChatView() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+  const [attachment, setAttachment] = useState<File | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -134,16 +206,26 @@ export default function ChatView() {
     ]);
 
     try {
-      const res = await fetch("/api/ai/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          messages: updatedMessages.map((m) => ({
-            role: m.role,
-            content: m.content,
-          })),
-        }),
-      });
+      const messagesPayload = {
+        messages: updatedMessages.map((m) => ({
+          role: m.role,
+          content: m.content,
+        })),
+      };
+
+      let res: Response;
+      if (attachment) {
+        const form = new FormData();
+        form.append("messages", JSON.stringify(messagesPayload));
+        form.append("attachment", attachment);
+        res = await fetch("/api/ai/chat", { method: "POST", body: form });
+      } else {
+        res = await fetch("/api/ai/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(messagesPayload),
+        });
+      }
 
       if (!res.ok) {
         const errText = await res.text();
@@ -269,10 +351,10 @@ export default function ChatView() {
             </p>
             <div className="mt-4 flex flex-wrap justify-center gap-2">
               {[
+                "Draft outreach emails to 5 recruiters (attach my resume)",
                 "Send an email to 5 people about Friday's meeting",
                 "What was my last email from Sarah?",
                 "Schedule a follow-up to John for tomorrow at 9am",
-                "Show me all urgent unread emails",
               ].map((suggestion) => (
                 <button
                   key={suggestion}
@@ -330,13 +412,73 @@ export default function ChatView() {
 
       {/* Input */}
       <div className="shrink-0 border-t border-zinc-100 px-6 py-3">
+        {attachment && (
+          <div className="mx-auto mb-2 flex max-w-2xl items-center gap-2 rounded-md border border-indigo-100 bg-indigo-50/60 px-2.5 py-1.5">
+            <svg width="11" height="11" viewBox="0 0 16 16" fill="none" className="text-indigo-500">
+              <path
+                d="M12 7.5V4a3 3 0 0 0-6 0v7a2 2 0 0 0 4 0V5.5"
+                stroke="currentColor"
+                strokeWidth="1.3"
+                strokeLinecap="round"
+              />
+            </svg>
+            <span className="truncate text-[11px] font-medium text-indigo-700">
+              {attachment.name}
+            </span>
+            <span className="text-[10px] text-indigo-400">
+              {formatFileSize(attachment.size)}
+            </span>
+            <button
+              onClick={() => {
+                setAttachment(null);
+                if (fileInputRef.current) fileInputRef.current.value = "";
+              }}
+              className="ml-auto flex h-4 w-4 items-center justify-center rounded text-indigo-400 transition-colors hover:bg-indigo-100 hover:text-indigo-700"
+              title="Remove attachment"
+            >
+              <svg width="9" height="9" viewBox="0 0 12 12" fill="none">
+                <path d="M1 1l10 10M11 1L1 11" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+              </svg>
+            </button>
+          </div>
+        )}
         <div className="mx-auto flex max-w-2xl items-end gap-2">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="application/pdf,.pdf"
+            className="hidden"
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              if (!file) return;
+              if (file.size > 25 * 1024 * 1024) {
+                alert("File must be under 25MB (Gmail's limit).");
+                return;
+              }
+              setAttachment(file);
+            }}
+          />
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            disabled={isLoading}
+            title="Attach PDF"
+            className="flex h-[42px] w-[42px] shrink-0 items-center justify-center rounded-lg border border-zinc-200 text-zinc-500 transition-colors hover:border-zinc-300 hover:bg-zinc-50 hover:text-zinc-800 disabled:opacity-40"
+          >
+            <svg width="15" height="15" viewBox="0 0 16 16" fill="none">
+              <path
+                d="M12 7.5V4a3 3 0 0 0-6 0v7a2 2 0 0 0 4 0V5.5"
+                stroke="currentColor"
+                strokeWidth="1.4"
+                strokeLinecap="round"
+              />
+            </svg>
+          </button>
           <textarea
             ref={inputRef}
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder="Send emails, search your inbox, ask anything..."
+            placeholder={attachment ? "Describe who to draft to and the message…" : "Send emails, draft, search your inbox, ask anything…"}
             rows={1}
             className="flex-1 resize-none rounded-lg border border-zinc-200 bg-white px-3 py-2.5 text-[13px] text-zinc-800 placeholder:text-zinc-400 outline-none transition-colors focus:border-zinc-300"
             style={{ minHeight: "42px", maxHeight: "120px" }}
@@ -369,6 +511,7 @@ export default function ChatView() {
         </div>
         <p className="mx-auto mt-1.5 max-w-2xl text-[10px] text-zinc-300">
           Enter to send &middot; Shift+Enter for new line
+          {attachment ? " · attachment will go on every draft" : ""}
         </p>
       </div>
     </div>

@@ -3,6 +3,7 @@ import { z } from "zod";
 import { auth } from "@/app/api/auth/[...nextauth]/route";
 import { createServiceRoleClient, emailToUserId } from "@/lib/supabase";
 import { sendEmail, fetchMessageIdHeader } from "@/lib/gmail";
+import { extractSenderContext } from "@/lib/read-receipt";
 
 const sendSchema = z.object({
   to: z.string().email(),
@@ -59,13 +60,18 @@ export async function POST(req: NextRequest) {
 
   // Immediate send: generate tracking token, insert read receipt, send
   const trackingToken = crypto.randomUUID();
+  const { senderIp, senderUa } = extractSenderContext(req.headers);
+  const sentAt = new Date().toISOString();
 
   const { error: receiptError } = await supabase.from("read_receipts").insert({
     token: trackingToken,
     user_id: userId,
-    email_message_id: "", // will be updated after send with real message ID
+    email_message_id: "", // updated post-send with real message id
     recipient_email: to,
     opened_at: null,
+    sent_at: sentAt,
+    sender_ip: senderIp || null,
+    sender_user_agent: senderUa || null,
   });
 
   if (receiptError) {

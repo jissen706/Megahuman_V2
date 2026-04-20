@@ -3,6 +3,7 @@ import { auth } from "@/app/api/auth/[...nextauth]/route";
 import { createServiceRoleClient, emailToUserId } from "@/lib/supabase";
 import SentList from "@/components/inbox/SentList";
 import { type Email } from "@/lib/supabase";
+import { countDistinctReads } from "@/lib/read-receipt-classify";
 
 type ExtendedSession = {
   user: { email: string };
@@ -11,6 +12,8 @@ type ExtendedSession = {
 
 interface SentEmail extends Email {
   opened_at?: string | null;
+  open_count?: number;
+  preloaded_only?: boolean; // only apple_mpp / gmail_proxy hits exist, no confirmed real open
 }
 
 /**
@@ -49,21 +52,62 @@ export default async function SentPage() {
     );
   }
 
-  // Fetch read receipts for these emails
+  // Fetch tracking data: each sent email → receipt row (→ token → opens log).
+  // We compute open_count (deduplicated by 30s window) and flag whether the
+  // only hits are preloads (apple_mpp) so the UI can label "Likely opened".
   const emailIds = emails.map((e) => e.id);
   const { data: receipts } = await supabase
     .from("read_receipts")
-    .select("email_message_id, opened_at")
+    .select("email_message_id, token, opened_at")
     .in("email_message_id", emailIds);
 
-  const receiptMap = new Map<string, string | null>(
-    (receipts ?? []).map((r) => [r.email_message_id, r.opened_at])
+  const tokens = (receipts ?? []).map((r) => r.token).filter(Boolean);
+  const { data: openHits } = tokens.length
+    ? await supabase
+        .from("email_opens")
+        .select("token, opened_at, ip_address, user_agent, is_real_open, classification")
+        .in("token", tokens)
+    : { data: [] as Array<{
+        token: string;
+        opened_at: string;
+        ip_address: string | null;
+        user_agent: string | null;
+        is_real_open: boolean;
+        classification: string;
+      }> };
+
+  const hitsByToken = new Map<string, typeof openHits>();
+  for (const h of openHits ?? []) {
+    const arr = hitsByToken.get(h.token) ?? [];
+    arr.push(h);
+    hitsByToken.set(h.token, arr);
+  }
+
+  const receiptByEmailId = new Map(
+    (receipts ?? []).map((r) => [r.email_message_id, r])
   );
 
-  const sentEmailsWithReceipts: SentEmail[] = emails.map((email) => ({
-    ...email,
-    opened_at: receiptMap.get(email.id) ?? null,
-  }));
+  const sentEmailsWithReceipts: SentEmail[] = emails.map((email) => {
+    const receipt = receiptByEmailId.get(email.id);
+    if (!receipt) return { ...email, opened_at: null, open_count: 0, preloaded_only: false };
+    const hits = hitsByToken.get(receipt.token) ?? [];
+    const { count, firstOpenedAt } = countDistinctReads(hits);
+    // If no real opens but there ARE preloads (apple_mpp / gmail_proxy filtered as cached),
+    // show the "Likely opened" state so Apple recipients don't look silent.
+    const hasPreloadOnly =
+      count === 0 &&
+      hits.some(
+        (h) =>
+          !h.is_real_open &&
+          (h.classification === "apple_mpp" || h.classification === "gmail_proxy_cached")
+      );
+    return {
+      ...email,
+      opened_at: firstOpenedAt ?? receipt.opened_at ?? null,
+      open_count: count,
+      preloaded_only: hasPreloadOnly,
+    };
+  });
 
   return (
     <main className="flex h-screen flex-col">
