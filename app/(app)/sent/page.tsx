@@ -62,19 +62,27 @@ export default async function SentPage() {
     .in("email_message_id", emailIds);
 
   const tokens = (receipts ?? []).map((r) => r.token).filter(Boolean);
-  const { data: openHits } = tokens.length
+  const openQueryResult = tokens.length
     ? await supabase
         .from("email_opens")
         .select("token, opened_at, ip_address, user_agent, is_real_open, classification")
         .in("token", tokens)
-    : { data: [] as Array<{
-        token: string;
-        opened_at: string;
-        ip_address: string | null;
-        user_agent: string | null;
-        is_real_open: boolean;
-        classification: string;
-      }> };
+    : {
+        data: [] as Array<{
+          token: string;
+          opened_at: string;
+          ip_address: string | null;
+          user_agent: string | null;
+          is_real_open: boolean;
+          classification: string;
+        }>,
+        error: null,
+      };
+  const openHits = openQueryResult.data;
+  // If email_opens isn't available (e.g. migration 005 not applied yet),
+  // fall back to the legacy opened_at flag on read_receipts so send-time
+  // tracking doesn't appear fully broken.
+  const legacyMode = !!openQueryResult.error;
 
   const hitsByToken = new Map<string, typeof openHits>();
   for (const h of openHits ?? []) {
@@ -90,10 +98,21 @@ export default async function SentPage() {
   const sentEmailsWithReceipts: SentEmail[] = emails.map((email) => {
     const receipt = receiptByEmailId.get(email.id);
     if (!receipt) return { ...email, opened_at: null, open_count: 0, preloaded_only: false };
+
+    if (legacyMode) {
+      // No email_opens table — treat any opened_at on the receipt as a
+      // single real open so the Sent view keeps working.
+      const openedAt = receipt.opened_at ?? null;
+      return {
+        ...email,
+        opened_at: openedAt,
+        open_count: openedAt ? 1 : 0,
+        preloaded_only: false,
+      };
+    }
+
     const hits = hitsByToken.get(receipt.token) ?? [];
     const { count, firstOpenedAt } = countDistinctReads(hits);
-    // If no real opens but there ARE preloads (apple_mpp / gmail_proxy filtered as cached),
-    // show the "Likely opened" state so Apple recipients don't look silent.
     const hasPreloadOnly =
       count === 0 &&
       hits.some(
