@@ -5,6 +5,7 @@ import { anthropic, FAST_MODEL } from "@/lib/claude";
 import { createServiceRoleClient, emailToUserId } from "@/lib/supabase";
 import { createDraft, plainTextToHtml, sendEmail, type DraftAttachmentInput } from "@/lib/gmail";
 import { buildTrackingPixel, extractSenderContext } from "@/lib/read-receipt";
+import { insertReceipt, updateReceipt } from "@/lib/read-receipt-db";
 import type Anthropic from "@anthropic-ai/sdk";
 
 type ExtendedSession = {
@@ -328,7 +329,7 @@ async function executeSendBatchEmails(
         const trackingToken = crypto.randomUUID();
         const sentAt = new Date().toISOString();
 
-        await supabase.from("read_receipts").insert({
+        await insertReceipt(supabase, {
           token: trackingToken,
           user_id: userId,
           email_message_id: "",
@@ -346,10 +347,7 @@ async function executeSendBatchEmails(
           trackingToken,
         });
 
-        await supabase
-          .from("read_receipts")
-          .update({ email_message_id: sentMessageId })
-          .eq("token", trackingToken);
+        await updateReceipt(supabase, trackingToken, { email_message_id: sentMessageId });
 
         results.push({ to: email.to, status: "sent", messageId: sentMessageId });
       }
@@ -413,7 +411,7 @@ async function executeCreateBatchDrafts(
       // natively we can't know the exact send time; the classifier still
       // works without it (grace period check is skipped).
       const trackingToken = crypto.randomUUID();
-      await supabase.from("read_receipts").insert({
+      await insertReceipt(supabase, {
         token: trackingToken,
         user_id: userId,
         email_message_id: "",
@@ -435,10 +433,7 @@ async function executeCreateBatchDrafts(
       // Link the tracking row to the draft's message id. When the user
       // sends the draft later, the pixel already embeds the token; the
       // row updates opened_at on pixel fetch.
-      await supabase
-        .from("read_receipts")
-        .update({ email_message_id: messageId })
-        .eq("token", trackingToken);
+      await updateReceipt(supabase, trackingToken, { email_message_id: messageId });
 
       results.push({
         to: d.to,

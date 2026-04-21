@@ -4,6 +4,7 @@ import { auth } from "@/app/api/auth/[...nextauth]/route";
 import { createServiceRoleClient, emailToUserId } from "@/lib/supabase";
 import { sendEmail, fetchMessageIdHeader } from "@/lib/gmail";
 import { extractSenderContext } from "@/lib/read-receipt";
+import { insertReceipt, updateReceipt } from "@/lib/read-receipt-db";
 
 const sendSchema = z.object({
   to: z.string().email(),
@@ -63,7 +64,7 @@ export async function POST(req: NextRequest) {
   const { senderIp, senderUa } = extractSenderContext(req.headers);
   const sentAt = new Date().toISOString();
 
-  const { error: receiptError } = await supabase.from("read_receipts").insert({
+  const { error: receiptError } = await insertReceipt(supabase, {
     token: trackingToken,
     user_id: userId,
     email_message_id: "", // updated post-send with real message id
@@ -100,10 +101,7 @@ export async function POST(req: NextRequest) {
   });
 
   // Update read receipt with the real sent message ID
-  await supabase
-    .from("read_receipts")
-    .update({ email_message_id: sentMessageId })
-    .eq("token", trackingToken);
+  await updateReceipt(supabase, trackingToken, { email_message_id: sentMessageId });
 
   return NextResponse.json({ sent: true, messageId: sentMessageId });
 }

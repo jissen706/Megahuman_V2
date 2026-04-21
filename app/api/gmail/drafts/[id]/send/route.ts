@@ -2,6 +2,7 @@ import { type NextRequest, NextResponse } from "next/server";
 import { auth } from "@/app/api/auth/[...nextauth]/route";
 import { getDraft, sendDraft } from "@/lib/gmail";
 import { extractSenderContext } from "@/lib/read-receipt";
+import { insertReceipt, updateReceipt } from "@/lib/read-receipt-db";
 import { createServiceRoleClient, emailToUserId } from "@/lib/supabase";
 
 type ExtendedSession = {
@@ -55,21 +56,18 @@ export async function POST(
       // stamp the real send time / sender fingerprint captured from THIS
       // request (which may differ from draft-create time if the user is
       // on a different device).
-      await supabase
-        .from("read_receipts")
-        .update({
-          email_message_id: sentMessageId,
-          recipient_email: draft.to,
-          sent_at: sentAtIso,
-          sender_ip: senderIp || null,
-          sender_user_agent: senderUa || null,
-        })
-        .eq("token", existing.token);
+      await updateReceipt(supabase, existing.token, {
+        email_message_id: sentMessageId,
+        recipient_email: draft.to,
+        sent_at: sentAtIso,
+        sender_ip: senderIp || null,
+        sender_user_agent: senderUa || null,
+      });
     } else {
       // Draft was created outside the MegaHuman flow (no pixel injected).
       // Insert a placeholder so Sent view still shows the send; tracking
       // is not possible because there's no pixel URL in the body.
-      await supabase.from("read_receipts").insert({
+      await insertReceipt(supabase, {
         token: crypto.randomUUID(),
         user_id: userId,
         email_message_id: sentMessageId,

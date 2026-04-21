@@ -3,11 +3,11 @@ import { after } from "next/server";
 import { TRANSPARENT_GIF } from "@/lib/read-receipt";
 import {
   classifyOpen,
-  countDistinctReads,
   extractClientIp,
   type OpenClassification,
 } from "@/lib/read-receipt-classify";
 import { createServiceRoleClient } from "@/lib/supabase";
+import { recordOpen, selectOpens, selectReceipt } from "@/lib/read-receipt-db";
 
 // Response headers required to prevent ANY proxy/CDN caching the pixel.
 // Without no-store, a recipient who opens an email twice only shows the
@@ -34,22 +34,13 @@ async function handle(req: NextRequest, token: string): Promise<NextResponse> {
     try {
       const supabase = createServiceRoleClient();
 
-      const { data: receipt } = await supabase
-        .from("read_receipts")
-        .select("token, sent_at, sender_ip, sender_user_agent, opened_at")
-        .eq("token", token)
-        .maybeSingle();
-
+      const receipt = await selectReceipt(supabase, token);
       if (!receipt) {
         // Unknown token — don't tip off clients but also don't log.
         return;
       }
 
-      const { data: priorHits } = await supabase
-        .from("email_opens")
-        .select("opened_at, classification, is_real_open")
-        .eq("token", token)
-        .order("opened_at", { ascending: true });
+      const { hits: priorHits } = await selectOpens(supabase, token);
 
       const classification = classifyOpen({
         now,
@@ -59,12 +50,16 @@ async function handle(req: NextRequest, token: string): Promise<NextResponse> {
         ip,
         ua,
         method,
-        priorHits: priorHits ?? [],
+        priorHits: priorHits.map((h) => ({
+          opened_at: h.opened_at,
+          classification: h.classification,
+          is_real_open: h.is_real_open,
+        })),
       });
 
-      // Always insert — even filtered hits are stored so classification can
-      // be audited / tuned later.
-      await supabase.from("email_opens").insert({
+      // recordOpen inserts into email_opens when available, otherwise
+      // updates read_receipts.opened_at directly (legacy mode).
+      await recordOpen(supabase, {
         token,
         opened_at: now.toISOString(),
         ip_address: ip || null,
@@ -73,41 +68,15 @@ async function handle(req: NextRequest, token: string): Promise<NextResponse> {
         classification: classification.classification satisfies OpenClassification,
       });
 
-      // Mirror the first real open onto read_receipts.opened_at for fast
-      // Sent-view display. countDistinctReads handles 30s dedup.
+      // On the first real open, also stamp read_receipts.opened_at so the
+      // Sent view's fast-path query sees it without having to roll up
+      // email_opens. (recordOpen already does this in legacy mode.)
       if (classification.isRealOpen && !receipt.opened_at) {
-        const allHits = [
-          ...(priorHits ?? []),
-          {
-            opened_at: now.toISOString(),
-            classification: classification.classification,
-            is_real_open: classification.isRealOpen,
-          },
-        ];
-        // Fetch ip/ua for dedup
-        const { data: hitsWithIp } = await supabase
-          .from("email_opens")
-          .select("opened_at, ip_address, user_agent, is_real_open")
-          .eq("token", token);
-        const hitsForCount = [
-          ...(hitsWithIp ?? []),
-          {
-            opened_at: now.toISOString(),
-            ip_address: ip || null,
-            user_agent: ua || null,
-            is_real_open: classification.isRealOpen,
-          },
-        ];
-        const { firstOpenedAt } = countDistinctReads(hitsForCount);
-        if (firstOpenedAt) {
-          await supabase
-            .from("read_receipts")
-            .update({ opened_at: firstOpenedAt })
-            .eq("token", token)
-            .is("opened_at", null);
-        }
-        // avoid unused-warning — allHits was kept for clarity only
-        void allHits;
+        await supabase
+          .from("read_receipts")
+          .update({ opened_at: now.toISOString() })
+          .eq("token", token)
+          .is("opened_at", null);
       }
     } catch (err) {
       console.error("[track] classification failed:", err);

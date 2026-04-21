@@ -10,6 +10,7 @@ import {
   type DraftAttachmentInput,
 } from "@/lib/gmail";
 import { buildTrackingPixel } from "@/lib/read-receipt";
+import { updateReceipt } from "@/lib/read-receipt-db";
 import { createServiceRoleClient, emailToUserId } from "@/lib/supabase";
 
 type ExtendedSession = {
@@ -116,10 +117,10 @@ export async function PATCH(
     // Keep the receipt row pointing at the current message id so the send
     // endpoint (and Sent view join) can find it.
     if (existingReceipt?.token) {
-      await supabase
-        .from("read_receipts")
-        .update({ email_message_id: newMessageId, recipient_email: to })
-        .eq("token", existingReceipt.token);
+      await updateReceipt(supabase, existingReceipt.token, {
+        email_message_id: newMessageId,
+        recipient_email: to,
+      });
     }
 
     return NextResponse.json({ ok: true });
