@@ -43,15 +43,28 @@ export async function GET() {
 
   const migrationApplied = hasNewColumns && hasEmailOpens;
 
-  // Recent data
-  const { data: recent } = await supabase
-    .from("read_receipts")
-    .select("token, email_message_id, recipient_email, sent_at, opened_at, sender_ip, sender_user_agent")
-    .eq("user_id", userId)
-    .order("sent_at", { ascending: false, nullsFirst: false })
-    .limit(5);
+  // Recent data — adapt SELECT to which columns actually exist. If migration
+  // 005 isn't applied we can only ask for legacy columns; asking for sent_at
+  // otherwise causes a PGRST schema-cache error and breaks this endpoint.
+  const recentResult = hasNewColumns
+    ? await supabase
+        .from("read_receipts")
+        .select(
+          "token, email_message_id, recipient_email, sent_at, opened_at, sender_ip, sender_user_agent"
+        )
+        .eq("user_id", userId)
+        .order("sent_at", { ascending: false, nullsFirst: false })
+        .limit(5)
+    : await supabase
+        .from("read_receipts")
+        .select("token, email_message_id, recipient_email, opened_at")
+        .eq("user_id", userId)
+        .order("opened_at", { ascending: false, nullsFirst: false })
+        .limit(5);
+  const recent = (recentResult.data ?? []) as Array<Record<string, unknown>>;
+  const recentError = recentResult.error?.message ?? null;
 
-  const tokens = (recent ?? []).map((r) => r.token);
+  const tokens = recent.map((r) => r.token as string).filter(Boolean);
   const { data: opens } = tokens.length && hasEmailOpens
     ? await supabase
         .from("email_opens")
@@ -79,7 +92,8 @@ export async function GET() {
         ? "Migration 005 not applied. Run supabase/migrations/005_read_receipt_v2.sql in the Supabase SQL editor."
         : null,
     },
-    recent_receipts: recent ?? [],
+    recent_receipts: recent,
+    recent_receipts_error: recentError,
     recent_opens: opens ?? [],
   });
 }
