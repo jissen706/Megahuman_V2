@@ -36,22 +36,43 @@ export async function insertReceipt(
   supabase: SupabaseClient,
   row: ReceiptInsert
 ): Promise<{ legacyMode: boolean; error: { message: string } | null }> {
-  const { error } = await supabase.from("read_receipts").insert(row);
-  if (!error) return { legacyMode: false, error: null };
-  if (!isMissingSchemaError(error)) return { legacyMode: false, error };
+  // Primary attempt — full v2 schema. Catches both returned errors AND
+  // thrown exceptions (e.g. supabase-js throwing on certain network paths).
+  let primaryErrorMessage: string | null = null;
+  try {
+    const { error } = await supabase.from("read_receipts").insert(row);
+    if (!error) return { legacyMode: false, error: null };
+    primaryErrorMessage = error.message;
+    if (!isMissingSchemaError(error)) return { legacyMode: false, error };
+  } catch (e) {
+    primaryErrorMessage = e instanceof Error ? e.message : String(e);
+    if (!isMissingSchemaError({ message: primaryErrorMessage })) {
+      console.error("[read-receipts] insert threw:", primaryErrorMessage);
+      return {
+        legacyMode: false,
+        error: { message: primaryErrorMessage ?? "insert threw" },
+      };
+    }
+  }
 
-  // Legacy fallback
+  // Legacy fallback — retry with only the columns that exist pre-migration.
   console.warn(
     "[read-receipts] migration 005 not applied — falling back to legacy insert"
   );
-  const { error: legacyError } = await supabase.from("read_receipts").insert({
-    token: row.token,
-    user_id: row.user_id,
-    email_message_id: row.email_message_id,
-    recipient_email: row.recipient_email,
-    opened_at: row.opened_at ?? null,
-  });
-  return { legacyMode: true, error: legacyError };
+  try {
+    const { error: legacyError } = await supabase.from("read_receipts").insert({
+      token: row.token,
+      user_id: row.user_id,
+      email_message_id: row.email_message_id,
+      recipient_email: row.recipient_email,
+      opened_at: row.opened_at ?? null,
+    });
+    return { legacyMode: true, error: legacyError };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error("[read-receipts] legacy insert threw:", msg);
+    return { legacyMode: true, error: { message: msg } };
+  }
 }
 
 /**
@@ -70,12 +91,25 @@ export async function updateReceipt(
     sender_user_agent?: string | null;
   }
 ): Promise<void> {
-  const { error } = await supabase.from("read_receipts").update(patch).eq("token", token);
-  if (!error) return;
-  if (!isMissingSchemaError(error)) {
-    console.error("[read-receipts] update failed:", error.message);
-    return;
+  let needsLegacy = false;
+  try {
+    const { error } = await supabase.from("read_receipts").update(patch).eq("token", token);
+    if (!error) return;
+    if (!isMissingSchemaError(error)) {
+      console.error("[read-receipts] update failed:", error.message);
+      return;
+    }
+    needsLegacy = true;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (!isMissingSchemaError({ message: msg })) {
+      console.error("[read-receipts] update threw:", msg);
+      return;
+    }
+    needsLegacy = true;
   }
+
+  if (!needsLegacy) return;
 
   // Re-run with only legacy columns
   const legacyPatch: Record<string, unknown> = {};
@@ -83,7 +117,11 @@ export async function updateReceipt(
   if (patch.recipient_email !== undefined) legacyPatch.recipient_email = patch.recipient_email;
   if (patch.opened_at !== undefined) legacyPatch.opened_at = patch.opened_at;
   if (Object.keys(legacyPatch).length === 0) return;
-  await supabase.from("read_receipts").update(legacyPatch).eq("token", token);
+  try {
+    await supabase.from("read_receipts").update(legacyPatch).eq("token", token);
+  } catch (e) {
+    console.error("[read-receipts] legacy update threw:", e);
+  }
 }
 
 export interface ReceiptRow {
