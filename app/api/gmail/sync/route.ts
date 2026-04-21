@@ -4,6 +4,7 @@ import { createServiceRoleClient, emailToUserId } from "@/lib/supabase";
 import { fetchInboxByCategory, fetchSentMessages } from "@/lib/gmail";
 import { extractVoiceProfile, bestPlainText } from "@/lib/voice-profile";
 import { sendEmail } from "@/lib/gmail";
+import { insertReceipt, updateReceipt } from "@/lib/read-receipt-db";
 
 type ExtendedSession = {
   user: { email: string };
@@ -132,7 +133,9 @@ export async function POST() {
     console.error("Voice profile extraction error:", err);
   }
 
-  // Process any scheduled sends that are now due
+  // Process any scheduled sends that are now due. Uses the same atomic
+  // claim pattern as the Inngest function so both paths can run safely
+  // without double-sending.
   const { data: dueSends } = await db
     .from("scheduled_sends")
     .select("*")
@@ -141,14 +144,28 @@ export async function POST() {
     .lte("send_at", new Date().toISOString());
 
   for (const row of dueSends ?? []) {
+    // Atomic claim — only the first caller wins.
+    const { data: claimed } = await db
+      .from("scheduled_sends")
+      .update({ sent: true })
+      .eq("id", row.id)
+      .eq("sent", false)
+      .select("id");
+    if (!claimed || claimed.length === 0) continue;
+
     try {
       const trackingToken = crypto.randomUUID();
-      await db.from("read_receipts").insert({
+      const sentAt = new Date().toISOString();
+
+      await insertReceipt(db, {
         token: trackingToken,
         user_id: userId,
         email_message_id: "",
         recipient_email: row.to_email,
         opened_at: null,
+        sent_at: sentAt,
+        sender_ip: null,
+        sender_user_agent: null,
       });
 
       const sentMessageId = await sendEmail(accessToken, {
@@ -158,16 +175,11 @@ export async function POST() {
         trackingToken,
       });
 
-      await Promise.all([
-        db.from("read_receipts")
-          .update({ email_message_id: sentMessageId })
-          .eq("token", trackingToken),
-        db.from("scheduled_sends")
-          .update({ sent: true })
-          .eq("id", row.id),
-      ]);
+      await updateReceipt(db, trackingToken, { email_message_id: sentMessageId });
     } catch (err) {
       console.error("Scheduled send failed:", row.id, err);
+      // Release claim so another attempt can retry.
+      await db.from("scheduled_sends").update({ sent: false }).eq("id", row.id);
     }
   }
 

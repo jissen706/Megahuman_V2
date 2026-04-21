@@ -2,6 +2,8 @@ import { inngest } from "@/lib/inngest";
 import { structuredOutput } from "@/lib/claude";
 import { createServiceRoleClient, type TriageLabel } from "@/lib/supabase";
 import { sendEmail } from "@/lib/gmail";
+import { getUsableAccessToken } from "@/lib/gmail-auth";
+import { insertReceipt, updateReceipt } from "@/lib/read-receipt-db";
 
 /**
  * Triggered after Gmail sync — classifies new emails and stores triage labels.
@@ -87,6 +89,11 @@ Preview: ${e.snippet}`
 
 /**
  * Sends a scheduled email at the specified time.
+ *
+ * Uses an atomic claim pattern: we first UPDATE scheduled_sends SET sent=true
+ * WHERE id=X AND sent=false. Only the request that flips the row actually
+ * proceeds to send. The sync-endpoint fallback uses the same pattern, so
+ * at most one of them can deliver each email even if both run.
  */
 export const sendScheduledEmail = inngest.createFunction(
   {
@@ -97,56 +104,80 @@ export const sendScheduledEmail = inngest.createFunction(
     const { scheduledSendId } = event.data;
     const supabase = createServiceRoleClient();
 
+    // Peek at the row before claiming so we have the send details.
     const { data: scheduled, error: fetchError } = await supabase
       .from("scheduled_sends")
       .select("*")
       .eq("id", scheduledSendId)
-      .eq("sent", false)
       .single();
 
     if (fetchError || !scheduled) {
-      throw new Error(`Scheduled send not found: ${scheduledSendId}`);
+      return { skipped: true, reason: "row not found" };
+    }
+    if (scheduled.sent) {
+      return { skipped: true, reason: "already sent" };
     }
 
-    const { data: tokenRow, error: tokenError } = await supabase
-      .from("user_tokens")
-      .select("access_token")
-      .eq("user_id", scheduled.user_id)
-      .single();
+    // Atomically claim the row. If 0 rows update, another worker got it first.
+    const { data: claimed, error: claimError } = await supabase
+      .from("scheduled_sends")
+      .update({ sent: true })
+      .eq("id", scheduledSendId)
+      .eq("sent", false)
+      .select("id");
+    if (claimError) throw new Error(`claim failed: ${claimError.message}`);
+    if (!claimed || claimed.length === 0) {
+      return { skipped: true, reason: "already claimed" };
+    }
 
-    if (tokenError || !tokenRow) {
-      throw new Error(`No access token found for user ${scheduled.user_id}`);
+    // Get a fresh access token (auto-refreshes if expired).
+    const accessToken = await getUsableAccessToken(scheduled.user_id);
+    if (!accessToken) {
+      // Release the claim so sync fallback can retry when user signs in.
+      await supabase
+        .from("scheduled_sends")
+        .update({ sent: false })
+        .eq("id", scheduledSendId);
+      throw new Error(
+        `No usable access token for user ${scheduled.user_id} — release claim`
+      );
     }
 
     const trackingToken = crypto.randomUUID();
+    const sentAt = new Date().toISOString();
 
-    await supabase.from("read_receipts").insert({
-      token: trackingToken,
-      user_id: scheduled.user_id,
-      email_message_id: "",
-      recipient_email: scheduled.to_email,
-      opened_at: null,
-    });
+    try {
+      await insertReceipt(supabase, {
+        token: trackingToken,
+        user_id: scheduled.user_id,
+        email_message_id: "",
+        recipient_email: scheduled.to_email,
+        opened_at: null,
+        sent_at: sentAt,
+        sender_ip: null,
+        sender_user_agent: null,
+      });
 
-    const sentMessageId = await sendEmail(tokenRow.access_token, {
-      to: scheduled.to_email,
-      subject: scheduled.subject,
-      body: scheduled.body,
-      trackingToken,
-    });
+      const sentMessageId = await sendEmail(accessToken, {
+        to: scheduled.to_email,
+        subject: scheduled.subject,
+        body: scheduled.body,
+        trackingToken,
+      });
 
-    await Promise.all([
-      supabase
-        .from("read_receipts")
-        .update({ email_message_id: sentMessageId })
-        .eq("token", trackingToken),
-      supabase
+      await updateReceipt(supabase, trackingToken, {
+        email_message_id: sentMessageId,
+      });
+
+      return { sent: scheduledSendId, messageId: sentMessageId };
+    } catch (err) {
+      // Send failed — release the claim so fallback can retry.
+      await supabase
         .from("scheduled_sends")
-        .update({ sent: true })
-        .eq("id", scheduledSendId),
-    ]);
-
-    return { sent: scheduledSendId, messageId: sentMessageId };
+        .update({ sent: false })
+        .eq("id", scheduledSendId);
+      throw err;
+    }
   }
 );
 

@@ -1,31 +1,36 @@
 import NextAuth from "next-auth";
 import Google from "next-auth/providers/google";
 import { createServiceRoleClient, emailToUserId } from "@/lib/supabase";
+import { refreshAccessToken } from "@/lib/gmail-auth";
 
-async function refreshAccessToken(refreshToken: string): Promise<{
-  accessToken: string;
-  expiresAt: number;
-} | null> {
-  try {
-    const res = await fetch("https://oauth2.googleapis.com/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        client_id: process.env.GOOGLE_CLIENT_ID!,
-        client_secret: process.env.GOOGLE_CLIENT_SECRET!,
-        grant_type: "refresh_token",
-        refresh_token: refreshToken,
-      }),
-    });
-    const data = await res.json() as { access_token?: string; expires_in?: number; error?: string };
-    if (!res.ok || data.error) return null;
-    return {
-      accessToken: data.access_token!,
-      expiresAt: Math.floor(Date.now() / 1000) + (data.expires_in ?? 3600),
-    };
-  } catch {
-    return null;
+// Best-effort upsert of the full token set (refresh_token + expires_at).
+// Falls back to legacy schema (access_token only) if migration 006 isn't
+// applied.
+async function upsertUserToken(row: {
+  user_id: string;
+  access_token: string;
+  refresh_token?: string | null;
+  expires_at?: number | null;
+}): Promise<void> {
+  const supabase = createServiceRoleClient();
+  const { error } = await supabase.from("user_tokens").upsert({
+    user_id: row.user_id,
+    access_token: row.access_token,
+    refresh_token: row.refresh_token ?? null,
+    expires_at: row.expires_at ?? null,
+    updated_at: new Date().toISOString(),
+  });
+  if (!error) return;
+  if (!/column|schema cache/i.test(error.message)) {
+    console.error("Failed to store user token:", error);
+    return;
   }
+  // Legacy fallback
+  await supabase.from("user_tokens").upsert({
+    user_id: row.user_id,
+    access_token: row.access_token,
+    updated_at: new Date().toISOString(),
+  });
 }
 
 export const { handlers, auth, signIn, signOut } = NextAuth({
@@ -61,13 +66,12 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
         const userId = emailToUserId(email);
         token.userId = userId;
         // Fire-and-forget — don't block auth on Supabase write
-        createServiceRoleClient().from("user_tokens").upsert({
+        upsertUserToken({
           user_id: userId,
-          access_token: account.access_token,
-          updated_at: new Date().toISOString(),
-        }).then(({ error }) => {
-          if (error) console.error("Failed to store access token:", error);
-        });
+          access_token: account.access_token!,
+          refresh_token: account.refresh_token ?? null,
+          expires_at: account.expires_at ?? null,
+        }).catch((e) => console.error("Failed to store user token:", e));
         return token;
       }
 
@@ -88,13 +92,12 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
       token.expiresAt = refreshed.expiresAt;
 
       // Fire-and-forget — don't block auth on Supabase write
-      createServiceRoleClient().from("user_tokens").upsert({
+      upsertUserToken({
         user_id: token.userId as string,
         access_token: refreshed.accessToken,
-        updated_at: new Date().toISOString(),
-      }).then(({ error }) => {
-        if (error) console.error("Failed to refresh token:", error);
-      });
+        refresh_token: refreshToken,
+        expires_at: refreshed.expiresAt,
+      }).catch((e) => console.error("Failed to refresh token:", e));
 
       return token;
     },

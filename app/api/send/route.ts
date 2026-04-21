@@ -5,6 +5,7 @@ import { createServiceRoleClient, emailToUserId } from "@/lib/supabase";
 import { sendEmail, fetchMessageIdHeader } from "@/lib/gmail";
 import { extractSenderContext } from "@/lib/read-receipt";
 import { insertReceipt, updateReceipt } from "@/lib/read-receipt-db";
+import { inngest } from "@/lib/inngest";
 
 const sendSchema = z.object({
   to: z.string().email(),
@@ -48,15 +49,34 @@ export async function POST(req: NextRequest) {
   const supabase = createServiceRoleClient();
 
   if (sendAt) {
-    const { error } = await supabase
+    const { data: inserted, error } = await supabase
       .from("scheduled_sends")
-      .insert({ user_id: userId, to_email: to, subject, body: emailBody, send_at: sendAt, sent: false });
+      .insert({ user_id: userId, to_email: to, subject, body: emailBody, send_at: sendAt, sent: false })
+      .select("id")
+      .single();
 
-    if (error) {
-      return NextResponse.json({ error: error.message }, { status: 500 });
+    if (error || !inserted) {
+      return NextResponse.json(
+        { error: error?.message ?? "Failed to schedule" },
+        { status: 500 }
+      );
     }
 
-    return NextResponse.json({ scheduled: true, sendAt });
+    // Fire an Inngest event scheduled for the send time. Inngest holds
+    // the event and fires it at `ts`. The sync endpoint also has a
+    // fallback pass over due scheduled_sends; the Inngest function uses
+    // an atomic claim to avoid double-sending.
+    try {
+      await inngest.send({
+        name: "email/send.scheduled",
+        data: { scheduledSendId: inserted.id as string },
+        ts: new Date(sendAt).getTime(),
+      });
+    } catch (err) {
+      console.warn("[send] inngest.send failed (sync fallback will catch it):", err);
+    }
+
+    return NextResponse.json({ scheduled: true, sendAt, id: inserted.id });
   }
 
   // Immediate send: generate tracking token, insert read receipt, send

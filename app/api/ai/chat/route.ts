@@ -6,6 +6,7 @@ import { createServiceRoleClient, emailToUserId } from "@/lib/supabase";
 import { createDraft, plainTextToHtml, sendEmail, type DraftAttachmentInput } from "@/lib/gmail";
 import { buildTrackingPixel, extractSenderContext } from "@/lib/read-receipt";
 import { insertReceipt, updateReceipt } from "@/lib/read-receipt-db";
+import { inngest } from "@/lib/inngest";
 import type Anthropic from "@anthropic-ai/sdk";
 
 type ExtendedSession = {
@@ -309,19 +310,36 @@ async function executeSendBatchEmails(
   for (const email of emails) {
     try {
       if (email.send_at) {
-        // Scheduled send
-        const { error } = await supabase.from("scheduled_sends").insert({
-          user_id: userId,
-          to_email: email.to,
-          subject: email.subject,
-          body: email.body,
-          send_at: email.send_at,
-          sent: false,
-        });
+        // Scheduled send — write row + fire delayed Inngest event.
+        const { data: inserted, error } = await supabase
+          .from("scheduled_sends")
+          .insert({
+            user_id: userId,
+            to_email: email.to,
+            subject: email.subject,
+            body: email.body,
+            send_at: email.send_at,
+            sent: false,
+          })
+          .select("id")
+          .single();
 
-        if (error) {
-          results.push({ to: email.to, status: "error", error: error.message });
+        if (error || !inserted) {
+          results.push({
+            to: email.to,
+            status: "error",
+            error: error?.message ?? "Failed to schedule",
+          });
         } else {
+          try {
+            await inngest.send({
+              name: "email/send.scheduled",
+              data: { scheduledSendId: inserted.id as string },
+              ts: new Date(email.send_at).getTime(),
+            });
+          } catch (err) {
+            console.warn("[chat] inngest.send failed:", err);
+          }
           results.push({ to: email.to, status: "scheduled", sendAt: email.send_at });
         }
       } else {
